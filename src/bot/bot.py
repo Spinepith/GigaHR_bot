@@ -1,16 +1,24 @@
+import datetime
 import time
+import sys
+import signal
 import atexit
 import threading
 import telebot
 
 from telebot import types
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from . import utils
 from . import gigahr
 
+from ..config import *
 
-TOKEN = ''
+
+TOKEN = BOT_TOKEN
 bot = telebot.TeleBot(TOKEN)
+
+employee_mod = False
 
 
 @bot.message_handler(commands=['start'])
@@ -36,6 +44,9 @@ def start_command(message):
 
 @bot.message_handler(commands=['vacancies'])
 def vacancies_command(message):
+    if employee_mod:
+        return
+
     vacancies_list = utils.get_vacancies()
     buttons_list = [[i[1], f'<vacancy>{i[0]}'] for i in vacancies_list]
 
@@ -115,6 +126,31 @@ def help_command(message):
     )
 
 
+@bot.message_handler(commands=[CHANGE_STATUS_COMMAND])
+def change_status_command(message):
+    if not utils.is_employee(message.from_user.id):
+        bot.send_message(message.chat.id, "Вы не найдены в базе данных сотрудников")
+        return
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton('Занятые даты'))
+    markup.row(
+        types.KeyboardButton('Добавить'),
+        types.KeyboardButton('Удалить')
+    )
+    markup.add(types.KeyboardButton('Все даты'))
+
+    bot.send_message(
+        message.chat.id,
+        '<b><em>ВЫ ПЕРЕКЛЮЧИЛИСЬ НА ВЕРСИЮ ДЛЯ СОТРУДНИКА</em></b>',
+        reply_markup=markup,
+        parse_mode='html'
+    )
+
+    global employee_mod
+    employee_mod = True
+
+
 @bot.message_handler(content_types=['text'])
 def not_command(message):
     if message.text.lower() == 'вакансии':
@@ -123,6 +159,51 @@ def not_command(message):
         mydata_command(message)
     elif message.text.lower() == 'мои собеседования':
         interviews_command(message)
+
+    elif employee_mod and message.text.lower() == 'добавить':
+        msg = bot.send_message(
+            message.chat.id,
+            "Введите вакансию в первой строке\n"
+            "Введите дату и время во второй строке\n\n"
+            "Химик-технолог\n"
+            "2025-12-16 14:20"
+            "\n\n"
+            "Обязательно соблюдайте формат из примера"
+        )
+        bot.register_next_step_handler(msg, add_interview)
+    elif employee_mod and (message.text.lower() == 'удалить' or message.text.lower() == 'занятые даты'):
+        if message.text.lower() == 'занятые даты':
+            slots = utils.get_interviews_employee(message.from_user.id)
+            buttons_list = [
+                [f"[{date}]", f"<interview_data>{slot_id}"] for _id, slot_id, date in slots
+            ]
+            list_type = "interviews_data"
+        else:
+            slots = utils.get_all_interviews_employee(message.from_user.id)
+            buttons_list = [
+                [f"[{_date} {_time}]", f"<del_interview>{slot_id}"] for slot_id, _date, _time, vacancy in slots
+            ]
+            list_type = "del_interviews"
+
+        if not slots:
+            bot.send_message(message.chat.id, "У вас нет созданных дат собеседований")
+        else:
+            bot.send_message(
+                message.chat.id,
+                '<b><em>СПИСОК ВСЕХ ДАТ</em></b>',
+                reply_markup=utils.inline_buttons_list(list_type, buttons_list, 0, 7),
+                parse_mode='html'
+            )
+    elif employee_mod and message.text.lower() == 'все даты':
+        slots = utils.get_all_interviews_employee(message.from_user.id)
+
+        if slots:
+            slots_message = "\n".join(f"[{_date} {_time}] {vacancy}" for slot_id, _date, _time, vacancy in slots)
+        else:
+            slots_message = "У вас нет созданных дат собеседований"
+
+        bot.send_message(message.chat.id, slots_message)
+
     else:
         utils.log_file(f'TG_ID: {message.from_user.id} - Пользователю будет отвечать GigaChat.')
 
@@ -243,8 +324,8 @@ def callback_message(callback):
         vacancy_id = int(parts[0].split(":")[1])
         slot_id = int(parts[1].split(":", 1)[1])
 
-        utils.cursor.execute("SELECT available_date, available_time FROM interview_slots WHERE id = %s;", (slot_id,))
-        available_date, available_time = utils.cursor.fetchone() or (None, None)
+        utils.cursor.execute("SELECT available_date, available_time, employee_tg_id FROM interview_slots WHERE id = %s;", (slot_id,))
+        available_date, available_time, employee_tg_id = utils.cursor.fetchone() or (None, None, None)
         date = f'{available_date} {available_time}'
 
         utils.cursor.execute("SELECT name FROM vacancies WHERE id = %s;", (vacancy_id,))
@@ -260,9 +341,9 @@ def callback_message(callback):
 
         try:
             utils.cursor.execute(
-                "INSERT INTO candidates (user_id, slot_id, date, vacancy_name, user_fio, user_resume, user_contact, status)"
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s);",
-                (callback.from_user.id, slot_id, date, vacancy_name, user_data[1], user_data[2], user_data[3], 'Назначено собеседование')
+                "INSERT INTO candidates (user_id, slot_id, date, employee_tg_id, vacancy_name, user_fio, user_resume, user_contact, status)"
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);",
+                (callback.from_user.id, slot_id, date, employee_tg_id, vacancy_name, user_data[1], user_data[2], user_data[3], 'Назначено собеседование')
             )
 
             bot.send_message(
@@ -375,6 +456,112 @@ def callback_message(callback):
             f'TG_ID: {callback.from_user.id} - Пользователь подписался на уведомление о собеседовании {vacancy_name}.'
         )
 
+    if callback.data.startswith('<interview_data>'):
+        try:
+            user_id = callback.from_user.id
+            slot_id = int(callback.data.split('<interview_data>')[1])
+            candidate = utils.get_data_interview_employee(user_id, slot_id)
+
+            statuses = ["Назначено собеседование", "На рассмотрении", "Принят", "Отказано"]
+            markup = InlineKeyboardMarkup()
+            for i, j in enumerate(statuses):
+                if candidate[6] != j:
+                    markup.add(InlineKeyboardButton(text=j, callback_data=f"<change_vacancy_status>{slot_id};{i}"))
+
+            bot.send_message(
+                callback.message.chat.id,
+                "<b>Информация о кандидате\n\n</b>"
+                f"{candidate[2]}\n"
+                f"{candidate[1]}\n\n"
+                f"{candidate[4]}\n\n"
+                f"{candidate[3]}\n"
+                f"{candidate[5]}\n\n"
+                f"[{candidate[6]}]",
+                reply_markup=markup,
+                parse_mode='html'
+            )
+        except Exception as e:
+            bot.send_message(callback.message.chat.id, "Произошла ошибка. Попробуйте еще раз.")
+            utils.log_file(
+                f'TG_ID: {callback.from_user.id} - '
+                f'Ошибка при получение информации о кандидате из БД.'
+            )
+            utils.log_file(e)
+
+    if callback.data.startswith('<del_interview>'):
+        try:
+            user_id = callback.from_user.id
+            slot_id = int(callback.data.split('<del_interview>')[1])
+            deleted = utils.delete_interview_employee(user_id, slot_id)
+            bot.send_message(
+                callback.message.chat.id,
+                "<b>Дата собеседования успешно удалена!</b>\n\n"
+                f"{deleted[0]} {deleted[1]}",
+                parse_mode='html'
+            )
+
+            try:
+                slots = utils.get_all_interviews_employee(callback.from_user.id)
+                buttons_list = [
+                    [f"[{_date} {_time}]", f"<del_interview>{slot_id}"] for slot_id, _date, _time, vacancy in slots
+                ]
+                bot.edit_message_reply_markup(
+                    callback.message.chat.id,
+                    callback.message.message_id,
+                    reply_markup=utils.inline_buttons_list('del_interviews', buttons_list, 0, 7),
+                )
+            except:
+                pass
+
+        except Exception as e:
+            bot.send_message(callback.message.chat.id, "Произошла ошибка. Попробуйте еще раз.")
+            utils.log_file(
+                f'TG_ID: {callback.from_user.id} - '
+                f'Ошибка при удалении даты собеседования из БД.'
+            )
+            utils.log_file(e)
+
+    if callback.data.startswith('<change_vacancy_status>'):
+        try:
+            user_id = callback.from_user.id
+            statuses = ["Назначено собеседование", "На рассмотрении", "Принят", "Отказано"]
+
+            payload = callback.data.replace("<change_vacancy_status>", "")
+            slot_id = int(payload.split(';')[0])
+            status = statuses[int(payload.split(';')[1])]
+
+            utils.set_status_interview_employee(slot_id, status)
+            candidate = utils.get_data_interview_employee(user_id, slot_id)
+
+            if status not in ("Принят", "Отказано"):
+                markup = InlineKeyboardMarkup()
+                for i, j in enumerate(statuses):
+                    if candidate[6] != j:
+                        markup.add(InlineKeyboardButton(text=j, callback_data=f"<change_vacancy_status>{slot_id};{i}"))
+            else:
+                markup = None
+
+            bot.edit_message_text(
+                chat_id=callback.message.chat.id,
+                message_id=callback.message.message_id,
+                text="<b>Информация о кандидате\n\n</b>"
+                     f"{candidate[2]}\n"
+                     f"{candidate[1]}\n\n"
+                     f"{candidate[4]}\n\n"
+                     f"{candidate[3]}\n"
+                     f"{candidate[5]}\n\n"
+                     f"[{candidate[6]}]",
+                reply_markup=markup,
+                parse_mode='html'
+            )
+        except Exception as e:
+            bot.send_message(callback.message.chat.id, "Произошла ошибка. Попробуйте еще раз.")
+            utils.log_file(
+                f'TG_ID: {callback.from_user.id} - '
+                f'Ошибка при изменении статуса собеседования.'
+            )
+            utils.log_file(e)
+
     if callback.data.startswith('<page/'):
         buttons_list = []
         list_type = ''
@@ -399,6 +586,24 @@ def callback_message(callback):
                 for i in candidates if user_id == i[1] and i[8] == "Назначено собеседование"
             ]
             list_type = 'my_interviews'
+        elif callback.data.startswith('<page/interview_data>'):
+            slots = utils.get_all_interviews_employee(callback.from_user.id)
+            buttons_list = [
+                [f"[{date}]", f"<interview_data>{slot_id}"] for _id, slot_id, date in slots
+            ]
+            list_type = 'interviews_data'
+        elif callback.data.startswith('<page/interviews_data>'):
+            slots = utils.get_interviews_employee(callback.from_user.id)
+            buttons_list = [
+                [f"[{date}]", f"<interview_data>{slot_id}"] for _id, slot_id, date in slots
+            ]
+            list_type = 'interviews_data'
+        elif callback.data.startswith('<page/del_interviews>'):
+            slots = utils.get_all_interviews_employee(callback.from_user.id)
+            buttons_list = [
+                [f"[{_date} {_time}]", f"<del_interview>{slot_id}"] for slot_id, _date, _time, vacancy in slots
+            ]
+            list_type = 'del_interviews'
 
         new_page = int(callback.data.split('>')[1])
         bot.edit_message_reply_markup(
@@ -406,6 +611,51 @@ def callback_message(callback):
             callback.message.message_id,
             reply_markup=utils.inline_buttons_list(list_type, buttons_list, new_page, 7)
         )
+
+
+def add_interview(message):
+    try:
+        lines = [line.strip() for line in message.text.strip().split('\n') if line.strip()]
+
+        if len(lines) != 2:
+            bot.send_message(message.chat.id, "Ошибка при добавлении даты собеседовании\nВведите две строки")
+            return
+
+        vacancy_name = lines[0]
+        datetime_str = lines[1]
+
+        try:
+            parts = datetime_str.strip().split(' ')
+            if len(parts) != 2:
+                raise ValueError
+
+            date_str, time_str = parts
+
+            datetime.datetime.strptime(date_str, "%Y-%m-%d")
+            datetime.datetime.strptime(time_str, "%H:%M")
+            time_str = time_str + ":00"
+        except:
+            bot.send_message(
+                message.chat.id,
+                "Ошибка при добавлении даты собеседовании\nНеверный формат даты и времени\n\n"
+                "Используйте: ГГГГ-ММ-ДД ЧЧ:ММ\n"
+                "Пример: 2025-12-16 14:20"
+            )
+            return
+
+        success = utils.add_interview_employee(message.from_user.id, vacancy_name, date_str, time_str)
+        if success:
+            bot.send_message(message.chat.id, "Дата собеседования успешно добавлена!\n\n")
+        else:
+            bot.send_message(
+                message.chat.id,
+                "Ошибка при добавлении даты собеседовании\n"
+                "Возможно данные дата и время уже существуют\n"
+                "Проверьте правильность введенных данных"
+            )
+    except:
+        bot.send_message(message.chat.id, "Ошибка при добавлении даты собеседовании. Попробуйте еще раз.")
+        utils.log_file("Ошибка при добавлении даты собеседовании")
 
 
 def check_notifications():
@@ -439,17 +689,56 @@ def check_notifications():
                 f"TG_ID: {user_id} - Пользователю отправлено уведомление смене статуса собеседования {vacancy_name}."
             )
 
+        rows = utils.notifications_employee()
+        for notification in rows:
+            record_id, employee_id, vacancy_name, user_fio, user_contact, user_resume, available_date, available_time, action_type = notification
+
+            message = (
+                f"<b>{'Новый кандидат' if action_type == 'added' else 'Кандидат отменил собеседование'}</b>\n\n"
+                f"{vacancy_name}\n"
+                f"{available_date} {available_time}\n\n"
+                f"{user_resume}\n\n"
+                f"{user_fio}\n"
+                f"{user_contact}"
+            )
+
+            try:
+                bot.send_message(
+                    employee_id,
+                    message,
+                    parse_mode="html"
+                )
+                utils.log_file(
+                    f"TG_ID: {employee_id} - Сотруднику отправлено уведомление о кандидате."
+                )
+            except telebot.apihelper.ApiTelegramException as e:
+                utils.log_file(
+                    f"TG_ID: {employee_id} - Сотруднику НЕ отправлено уведомление о кандидате. {e}"
+                )
+
         time.sleep(10)
 
 
 def start_bot():
-    try:
-        print("\n# БОТ ЗАПУЩЕН\nЧТОБЫ ОСТАНОВИТЬ - НАЖМИТЕ Ctrl + C ИЛИ Control + C")
-        utils.log_file('БОТ ЗАПУЩЕН')
-        threading.Thread(target=check_notifications, daemon=True).start()
-        atexit.register(lambda: (utils.cursor.close(), utils.connection.close(), utils.log_file('БОТ ЗАВЕРШИЛ РАБОТУ')))
-        bot.polling()
-        print("# БОТ ЗАВЕРШИЛ РАБОТУ\n")
-    except Exception as e:
-        utils.log_file(e)
-        print(f"# БОТ ЗАВЕРШИЛ РАБОТУ С ОШИБКОЙ\n{e}\n")
+    threading.Thread(target=check_notifications, daemon=True).start()
+    atexit.register(lambda: (utils.cursor.close(), utils.connection.close()))
+    signal.signal(signal.SIGINT, lambda sig, name: sys.exit(0))
+
+    while True:
+        try:
+            print("\n# БОТ ЗАПУЩЕН\nЧТОБЫ ОСТАНОВИТЬ - НАЖМИТЕ Ctrl + C ИЛИ Control + C")
+            utils.log_file("БОТ ЗАПУЩЕН")
+
+            bot.polling(none_stop=False, interval=1, timeout=10)
+
+            utils.log_file("БОТ ЗАВЕРШИЛ РАБОТУ")
+            print("# БОТ ЗАВЕРШИЛ РАБОТУ\n")
+        except SystemExit:
+            utils.log_file(f"ПОЛЬЗОВАТЕЛЬ ЗАВЕРШИЛ РАБОТУ БОТА")
+            print(f"# ПОЛЬЗОВАТЕЛЬ ЗАВЕРШИЛ РАБОТУ БОТА")
+            break
+        except Exception as e:
+            utils.log_file("# КРИТИЧЕСКАЯ ОШИБКА. БОТ ЗАВЕРШИЛ РАБОТУ. БОТ БУДЕТ ПЕРЕЗАПУЩЕН ЧЕРЕЗ 5 СЕКУНД")
+            utils.log_file(e)
+            print(f"# КРИТИЧЕСКАЯ ОШИБКА. БОТ ЗАВЕРШИЛ РАБОТУ\n{e}\n\nБОТ БУДЕТ ПЕРЕЗАПУЩЕН ЧЕРЕЗ 5 СЕКУНД")
+            time.sleep(5)

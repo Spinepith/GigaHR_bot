@@ -4,8 +4,10 @@ from langchain_core.runnables import RunnableSequence
 from langchain.schema import HumanMessage, AIMessage
 from langchain_core.chat_history import InMemoryChatMessageHistory
 
+from ..config import *
 
-TOKEN = ''
+
+TOKEN = GIGACHAT_TOKEN
 
 llm = GigaChat(credentials=TOKEN, verify_ssl_certs=False)
 

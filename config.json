@@ -1,0 +1,10 @@
+{
+    "db_name": "",
+    "db_user": "",
+    "db_password": "",
+    "db_host": "",
+    "db_port": null,
+    "bot_token": "",
+    "gigachat_token": "",
+    "change_status_command": ""
+}
